@@ -693,24 +693,24 @@ pub fn build_heading_map(pages: &[ParsedPage], body_size: f32) -> Vec<(f32, u8)>
 /// pages and body size.
 #[derive(Debug, Clone, Default)]
 pub struct HeadingMapAccumulator {
-    /// Group key → index into `groups`.
-    index: HashMap<(u32, bool, u64), usize>,
-    /// Groups in first-seen order, so the size that represents a rounded
-    /// size key is the first one seen in reading order, as in a single pass.
-    groups: Vec<HeadingLineGroup>,
+    /// `(size bits, size is estimated, hash of normalize_repeat_key)` →
+    /// that group's counts.
+    groups: HashMap<(u32, bool, u64), HeadingLineGroup>,
 }
 
-#[derive(Debug, Clone)]
+/// Counts for one group of lines. `u32` keeps a group at 16 bytes, which
+/// matters because body lines are mostly distinct, so there is roughly one
+/// group per line of the document.
+#[derive(Debug, Clone, Copy)]
 struct HeadingLineGroup {
-    size: f32,
-    font_size_is_estimated: bool,
-    /// Hash of [`normalize_repeat_key`] of the line text.
-    repeat_key: u64,
-    lines: usize,
+    /// Creation order of the group, so the size that represents a rounded
+    /// size key is the first one seen in reading order, as in a single pass.
+    first_seen: u32,
+    lines: u32,
     /// Non-whitespace characters across the group's lines.
-    chars: usize,
+    chars: u32,
     /// Alphabetic characters across the group's lines.
-    alpha: usize,
+    alpha: u32,
 }
 
 impl HeadingMapAccumulator {
@@ -722,23 +722,20 @@ impl HeadingMapAccumulator {
             if is_rotated_line(line) || line.in_figure || is_caption_line(&line.text) {
                 continue;
             }
-            let size = heading_size_of(line);
             let mut hasher = DefaultHasher::new();
             normalize_repeat_key(&line.text).hash(&mut hasher);
-            let repeat_key = hasher.finish();
-            let key = (size.to_bits(), line.font_size_is_estimated, repeat_key);
-            let idx = *self.index.entry(key).or_insert_with(|| {
-                self.groups.push(HeadingLineGroup {
-                    size,
-                    font_size_is_estimated: line.font_size_is_estimated,
-                    repeat_key,
-                    lines: 0,
-                    chars: 0,
-                    alpha: 0,
-                });
-                self.groups.len() - 1
+            let key = (
+                heading_size_of(line).to_bits(),
+                line.font_size_is_estimated,
+                hasher.finish(),
+            );
+            let first_seen = self.groups.len() as u32;
+            let group = self.groups.entry(key).or_insert(HeadingLineGroup {
+                first_seen,
+                lines: 0,
+                chars: 0,
+                alpha: 0,
             });
-            let group = &mut self.groups[idx];
             group.lines += 1;
             for c in line.text.chars() {
                 if c.is_whitespace() {
@@ -753,37 +750,42 @@ impl HeadingMapAccumulator {
     }
 
     pub fn finish(&self, body_size: f32) -> Vec<(f32, u8)> {
-        let above_body = |group: &HeadingLineGroup| {
-            let margin = if group.font_size_is_estimated {
-                ESTIMATED_HEADING_SIZE_MARGIN
-            } else {
-                HEADING_SIZE_EPSILON
-            };
-            group.size > body_size + margin
-        };
-        // First pass: frequency of each normalized candidate-line text. A string
-        // that recurs ≥ REPEATED_HEADING_LINE_MIN times is chart/figure label spam
+        // Only lines larger than the body can be headings; that is a small
+        // fraction of the groups, so filter before sorting.
+        let mut candidates: Vec<(f32, u64, HeadingLineGroup)> = self
+            .groups
+            .iter()
+            .filter_map(|(&(size_bits, estimated, repeat_key), group)| {
+                let size = f32::from_bits(size_bits);
+                let margin = if estimated {
+                    ESTIMATED_HEADING_SIZE_MARGIN
+                } else {
+                    HEADING_SIZE_EPSILON
+                };
+                (size > body_size + margin).then_some((size, repeat_key, *group))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, _, group)| group.first_seen);
+        // Frequency of each normalized candidate-line text. A string that
+        // recurs ≥ REPEATED_HEADING_LINE_MIN times is chart/figure label spam
         // (e.g. repeated attention-plot labels at 23–28pt), not a heading.
         let mut text_freq: HashMap<u64, usize> = HashMap::new();
-        for group in self.groups.iter().filter(|g| above_body(g)) {
-            *text_freq.entry(group.repeat_key).or_insert(0) += group.lines;
+        for (_, repeat_key, group) in &candidates {
+            *text_freq.entry(*repeat_key).or_insert(0) += group.lines as usize;
         }
         // (size_key → (size, line_count, total_chars, alpha_chars))
         let mut sizes: HashMap<u32, (f32, usize, usize, usize)> = HashMap::new();
-        for group in &self.groups {
+        for (size, repeat_key, group) in &candidates {
             // Exclude repeated chart/figure labels (per-line, so a repeated
             // string sharing a size with real headings still leaves that level).
-            if !above_body(group)
-                || text_freq.get(&group.repeat_key).copied().unwrap_or(0)
-                    >= REPEATED_HEADING_LINE_MIN
-            {
+            if text_freq.get(repeat_key).copied().unwrap_or(0) >= REPEATED_HEADING_LINE_MIN {
                 continue;
             }
-            let key = (group.size * 100.0).round() as u32;
-            let entry = sizes.entry(key).or_insert((group.size, 0, 0, 0));
-            entry.1 += group.lines;
-            entry.2 += group.chars;
-            entry.3 += group.alpha;
+            let key = (size * 100.0).round() as u32;
+            let entry = sizes.entry(key).or_insert((*size, 0, 0, 0));
+            entry.1 += group.lines as usize;
+            entry.2 += group.chars as usize;
+            entry.3 += group.alpha as usize;
         }
         let all: Vec<(f32, usize, usize, usize)> = sizes.into_values().collect();
         // Always apply quality filters: total-char floor, average-line cap, and
